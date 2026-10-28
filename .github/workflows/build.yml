@@ -1,0 +1,78 @@
+name: Build BookVox
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HAS_KEY: ${{ secrets.KEYSTORE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Número de versión interno (siempre mayor que el anterior)
+        run: echo "VERSION_CODE=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_ENV"
+
+      - name: APK de prueba
+        run: gradle assembleDebug --no-daemon
+
+      - name: Comprobar alineación 16 KB de las librerías nativas
+        run: |
+          APK=$(ls app/build/outputs/apk/debug/*.apk)
+          mkdir -p "$RUNNER_TEMP/apkx" && unzip -oq "$APK" 'lib/*' -d "$RUNNER_TEMP/apkx"
+          for f in $(find "$RUNNER_TEMP/apkx/lib" -name '*.so'); do
+            al=$(readelf -lW "$f" | awk '$1=="LOAD"{print $NF}' | sort -u | tr '\n' ' ')
+            echo "$(basename "$f"): $al"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BookVox-apk-debug
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Preparar clave
+        if: env.HAS_KEY == 'true'
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/bookvox.jks"
+
+      - name: APK y AAB firmados
+        if: env.HAS_KEY == 'true'
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/bookvox.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          gradle assembleRelease bundleRelease --no-daemon
+          mkdir -p dist
+          NAME="BookVox-${GITHUB_REF_NAME//\//-}"
+          cp app/build/outputs/apk/release/*.apk "dist/$NAME.apk"
+          cp app/build/outputs/bundle/release/*.aab "dist/$NAME.aab"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        if: env.HAS_KEY == 'true'
+        with:
+          name: BookVox-release
+          path: dist/*
+
+      - name: Adjuntar a la versión (solo con etiqueta v*)
+        if: env.HAS_KEY == 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
